@@ -132,7 +132,6 @@ def download_public_drive_file(drive_url: str):
     session = requests.Session()
     res = session.get(download_url, timeout=60)
 
-    # กรณีไฟล์ใหญ่ Google Drive จะขึ้นหน้า Confirm
     for key, value in res.cookies.items():
         if key.startswith("download_warning"):
             res = session.get(f"{download_url}&confirm={value}", timeout=60)
@@ -142,7 +141,6 @@ def download_public_drive_file(drive_url: str):
     if "text/html" in content_type:
         raise Exception("ไม่สามารถดาวน์โหลดไฟล์ได้ (กรุณาเช็กว่าตั้งค่าแชร์ไฟล์เป็น 'ทุกคนที่มีลิงก์' และไม่ได้ปิดการดาวน์โหลด)")
 
-    # พยายามดึงชื่อไฟล์จาก Header
     cd = res.headers.get("Content-Disposition", "")
     fname_match = re.search(r'filename="?([^";]+)"?', cd)
     file_name = fname_match.group(1) if fname_match else f"Drive_Exam_{file_id[:6]}.pdf"
@@ -176,9 +174,38 @@ class StudySummary(BaseModel):
     subtitle: str = Field(description="คำอธิบายสั้นๆ หรือรายวิชา")
     sections: list[SlideOrSection]
 
-# --- ฟังก์ชันเรียก Gemini AI ---
+# --- ฟังก์ชันเชื่อมต่อ Gemini (บังคับใช้ v1beta เพื่อรองรับโมเดลทุกตัว) ---
+def get_gemini_client(api_key: str):
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1beta")
+    )
+
+@st.cache_data(ttl=3600)
+def fetch_available_models(api_key: str):
+    fallback = ["gemini-2.5-pro", "gemini-2.5-flash"]
+    if not api_key:
+        return fallback
+    try:
+        client = get_gemini_client(api_key)
+        models = []
+        excluded_keywords = ("embedding", "imagen", "veo", "tts", "audio", "robotics", "computer-use")
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            if "generateContent" in actions:
+                name = m.name.replace("models/", "")
+                if "gemini" in name and not any(k in name for k in excluded_keywords):
+                    models.append(name)
+        if not models:
+            return fallback
+        # เรียงให้โมเดลรุ่นใหม่และรุ่น Pro/Flash อยู่ด้านบน
+        models.sort(reverse=True)
+        return models
+    except Exception:
+        return fallback
+
 def analyze_exam_with_gemini(file_bytes: bytes, mime_type: str, file_name: str, gemini_key: str, model_name: str, use_thinking: bool):
-    client = genai.Client(api_key=gemini_key)
+    client = get_gemini_client(gemini_key)
     prompt = f"""
     คุณคืออาจารย์และผู้เชี่ยวชาญด้านการเฉลยข้อสอบ 
     จงอ่านข้อสอบทั้งหมดในไฟล์ '{file_name}' นี้ แล้วดำเนินการดังนี้:
@@ -203,7 +230,7 @@ def analyze_exam_with_gemini(file_bytes: bytes, mime_type: str, file_name: str, 
     return json.loads(response.text).get("questions", [])
 
 def summarize_file_with_gemini(uploaded_file, custom_prompt: str, output_format: str, summary_lang: str, gemini_key: str, model_name: str, use_thinking: bool):
-    client = genai.Client(api_key=gemini_key)
+    client = get_gemini_client(gemini_key)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp:
         tmp.write(uploaded_file.getvalue())
@@ -382,23 +409,22 @@ with st.sidebar:
         gemini_key = DEFAULT_GEMINI_KEY
 
     st.subheader("🧠 เลือกโมเดล AI")
-    model_preset = st.selectbox(
-        "เลือกรุ่นโมเดล",
-        options=[
-            "gemini-2.5-pro",
-            "gemini-3.1-pro-preview",
-            "gemini-3-flash-preview",
-            "gemini-2.5-flash",
-            "กำหนดชื่อ Model ID เอง..."
-        ],
-        index=0
+    available_models = fetch_available_models(gemini_key)
+    selected_model = st.selectbox(
+        "เลือกรุ่นโมเดลที่ใช้ได้",
+        options=available_models,
+        index=0,
+        help="รายชื่อโมเดลถูกดึงจาก API Key โดยตรง"
     )
-    if model_preset == "กำหนดชื่อ Model ID เอง...":
-        selected_model = st.text_input("พิมพ์ชื่อ Model ID", value="gemini-3.1-pro-preview")
-    else:
-        selected_model = model_preset
+    if st.button("🔄 รีเฟรชรายชื่อโมเดล", use_container_width=True):
+        fetch_available_models.clear()
+        st.rerun()
 
-    use_thinking = st.checkbox("เปิดโหมดคิดวิเคราะห์ลึก (Thinking)", value=True, help="ช่วยให้คำนวณและสรุปเนื้อหาซับซ้อนแม่นยำขึ้น")
+    use_thinking = st.checkbox(
+        "เปิดโหมดคิดวิเคราะห์ลึก (Thinking)",
+        value=True,
+        help="ใช้ได้กับโมเดลตระกูล 2.5 และ 3.x (หากเลือกรุ่นเก่าที่ไม่รองรับ Thinking ให้ติ๊กออก)"
+    )
 
 # --- พื้นที่หลัก 2 โหมด ---
 st.title("🎓 AI Study & Exam Assistant")
@@ -470,10 +496,8 @@ with tab_exam:
 
     st.divider()
 
-    # โหลดข้อมูลตามสิทธิ์
     questions = load_questions_for_user(CURRENT_USER, IS_ADMIN)
 
-    # จัดการสำรอง/ลบข้อมูล
     with st.expander("💾 สำรอง / กู้คืน / ลบข้อมูลเฉลย"):
         c_dl, c_ul, c_del = st.columns(3)
         with c_dl:
@@ -518,7 +542,6 @@ with tab_exam:
                         st.warning(f"ลบข้อมูลของ {f_name} แล้ว")
                         st.rerun()
 
-    # แสดงผลคลังข้อสอบ
     if not questions:
         st.info("ยังไม่มีข้อมูลเฉลยข้อสอบของคุณ อัปโหลดไฟล์ PDF/รูปภาพ หรือวางลิงก์ไฟล์ด้านบนเพื่อเริ่มเฉลยได้เลยครับ")
     else:
