@@ -1,9 +1,11 @@
+import datetime
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 import requests
 import streamlit as st
@@ -60,7 +62,7 @@ if st.session_state["username"] is None:
 CURRENT_USER = st.session_state["username"]
 IS_ADMIN = (st.session_state["role"] == "admin")
 
-# --- จัดการฐานข้อมูล SQLite (ผูกข้อมูลกับ owner_username) ---
+# --- จัดการฐานข้อมูล SQLite (ข้อสอบ + บันทึกการใช้ Token) ---
 DB_FILE = "exam_solutions_v3.db"
 
 def init_db():
@@ -79,6 +81,56 @@ def init_db():
             final_answer TEXT
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS token_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            log_date TEXT,
+            username TEXT,
+            model_name TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            total_tokens INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def log_token_usage(username: str, model_name: str, usage_meta):
+    if not usage_meta:
+        return
+    in_tok = getattr(usage_meta, "prompt_token_count", 0) or 0
+    out_tok = (getattr(usage_meta, "candidates_token_count", 0) or 0) + (getattr(usage_meta, "thoughts_token_count", 0) or 0)
+    tot_tok = getattr(usage_meta, "total_token_count", 0) or (in_tok + out_tok)
+    today_str = datetime.date.today().isoformat()
+
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO token_logs (log_date, username, model_name, input_tokens, output_tokens, total_tokens)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (today_str, username, model_name, in_tok, out_tok, tot_tok))
+    conn.commit()
+    conn.close()
+
+def get_today_token_stats(username: str, is_admin: bool):
+    today_str = datetime.date.today().isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # ยอดรวมทั้งระบบวันนี้ (ใช้เช็กโควตา API Key กลาง)
+    c.execute("SELECT COALESCE(SUM(total_tokens), 0), COUNT(*) FROM token_logs WHERE log_date = ?", (today_str,))
+    global_tokens, global_reqs = c.fetchone()
+
+    # ยอดเฉพาะของ user คนนี้วันนี้
+    c.execute("SELECT COALESCE(SUM(total_tokens), 0), COUNT(*) FROM token_logs WHERE log_date = ? AND username = ?", (today_str, username))
+    user_tokens, user_reqs = c.fetchone()
+    conn.close()
+    return global_tokens, global_reqs, user_tokens, user_reqs
+
+def reset_today_tokens():
+    today_str = datetime.date.today().isoformat()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM token_logs WHERE log_date = ?", (today_str,))
     conn.commit()
     conn.close()
 
@@ -119,7 +171,7 @@ def load_questions_for_user(username: str, is_admin: bool):
 
 init_db()
 
-# --- ดาวน์โหลดไฟล์เดี่ยวจากลิงก์ Google Drive (ไม่ต้องใช้ API Key) ---
+# --- ดาวน์โหลดไฟล์เดี่ยวจากลิงก์ Google Drive ---
 def download_public_drive_file(drive_url: str):
     match = re.search(r"/d/([a-zA-Z0-9_-]+)", drive_url)
     if not match:
@@ -174,7 +226,7 @@ class StudySummary(BaseModel):
     subtitle: str = Field(description="คำอธิบายสั้นๆ หรือรายวิชา")
     sections: list[SlideOrSection]
 
-# --- ฟังก์ชันเชื่อมต่อ Gemini (บังคับใช้ v1beta เพื่อรองรับโมเดลทุกตัว) ---
+# --- ฟังก์ชันเชื่อมต่อ Gemini (v1beta) ---
 def get_gemini_client(api_key: str):
     return genai.Client(
         api_key=api_key,
@@ -198,13 +250,22 @@ def fetch_available_models(api_key: str):
                     models.append(name)
         if not models:
             return fallback
-        # เรียงให้โมเดลรุ่นใหม่และรุ่น Pro/Flash อยู่ด้านบน
         models.sort(reverse=True)
         return models
     except Exception:
         return fallback
 
-def analyze_exam_with_gemini(file_bytes: bytes, mime_type: str, file_name: str, gemini_key: str, model_name: str, use_thinking: bool):
+def get_model_daily_limits(model_name: str):
+    """ประมาณการลิมิต Free Tier ต่อวัน (Tokens/วัน และ Requests/วัน) ตามรุ่นโมเดล"""
+    m = model_name.lower()
+    if "pro" in m:
+        return 250_000, 50      # รุ่น Pro โควตาต่อวันน้อยกว่า (~250k tokens / 50 reqs)
+    elif "lite" in m:
+        return 1_500_000, 1000  # รุ่น Flash-Lite โควตาเยอะสุด
+    else:
+        return 1_000_000, 250   # รุ่น Flash มาตรฐาน (~1M tokens / 250 reqs)
+
+def analyze_exam_with_gemini(file_bytes: bytes, mime_type: str, file_name: str, gemini_key: str, model_name: str, use_thinking: bool, username: str):
     client = get_gemini_client(gemini_key)
     prompt = f"""
     คุณคืออาจารย์และผู้เชี่ยวชาญด้านการเฉลยข้อสอบ 
@@ -227,20 +288,31 @@ def analyze_exam_with_gemini(file_bytes: bytes, mime_type: str, file_name: str, 
         contents=[types.Part.from_bytes(data=file_bytes, mime_type=mime_type), prompt],
         config=types.GenerateContentConfig(**config_args)
     )
+    log_token_usage(username, model_name, getattr(response, "usage_metadata", None))
     return json.loads(response.text).get("questions", [])
 
-def summarize_file_with_gemini(uploaded_file, custom_prompt: str, output_format: str, summary_lang: str, gemini_key: str, model_name: str, use_thinking: bool):
+def summarize_file_with_gemini(file_bytes: bytes, file_name: str, custom_prompt: str, output_format: str, summary_lang: str, gemini_key: str, model_name: str, use_thinking: bool, username: str, cancel_event: threading.Event):
     client = get_gemini_client(gemini_key)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp:
-        tmp.write(uploaded_file.getvalue())
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file_name}") as tmp:
+        tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
+        if cancel_event.is_set():
+            return None
+
         gemini_file = client.files.upload(file=tmp_path)
         while gemini_file.state.name == "PROCESSING":
+            if cancel_event.is_set():
+                client.files.delete(name=gemini_file.name)
+                return None
             time.sleep(2)
             gemini_file = client.files.get(name=gemini_file.name)
+
+        if cancel_event.is_set():
+            client.files.delete(name=gemini_file.name)
+            return None
 
         style_instruction = (
             "จัดโครงสร้างเป็นสไลด์นำเสนอ (Presentation Slides) แบ่งเป็นสไลด์ละ 1 หัวข้อย่อย เนื้อหากระชับ อ่านง่าย เป็น Bullet points ชัดเจน ไม่ยาวล้นหน้า"
@@ -277,8 +349,11 @@ def summarize_file_with_gemini(uploaded_file, custom_prompt: str, output_format:
             contents=[gemini_file, prompt],
             config=types.GenerateContentConfig(**config_args)
         )
-
+        log_token_usage(username, model_name, getattr(response, "usage_metadata", None))
         client.files.delete(name=gemini_file.name)
+
+        if cancel_event.is_set():
+            return None
         return json.loads(response.text)
     finally:
         if os.path.exists(tmp_path):
@@ -413,8 +488,7 @@ with st.sidebar:
     selected_model = st.selectbox(
         "เลือกรุ่นโมเดลที่ใช้ได้",
         options=available_models,
-        index=0,
-        help="รายชื่อโมเดลถูกดึงจาก API Key โดยตรง"
+        index=0
     )
     if st.button("🔄 รีเฟรชรายชื่อโมเดล", use_container_width=True):
         fetch_available_models.clear()
@@ -426,19 +500,133 @@ with st.sidebar:
         help="ใช้ได้กับโมเดลตระกูล 2.5 และ 3.x (หากเลือกรุ่นเก่าที่ไม่รองรับ Thinking ให้ติ๊กออก)"
     )
 
+    # --- แถบแสดงลิมิตการใช้ Token ประจำวัน ---
+    st.divider()
+    st.subheader("📊 โควตา Token วันนี้ (Free Tier)")
+    g_tokens, g_reqs, u_tokens, u_reqs = get_today_token_stats(CURRENT_USER, IS_ADMIN)
+    max_tokens, max_reqs = get_model_daily_limits(selected_model)
+
+    ratio_tok = min(g_tokens / max_tokens, 1.0)
+    pct_tok = (g_tokens / max_tokens) * 100
+
+    st.progress(ratio_tok)
+    if pct_tok >= 90:
+        st.error(f"🚨 ใกล้เต็มแล้ว! ใช้ไป **{pct_tok:.1f}%** ({g_tokens:,} / {max_tokens:,} tokens)")
+    elif pct_tok >= 70:
+        st.warning(f"⚠️ ใช้ไป **{pct_tok:.1f}%** ({g_tokens:,} / {max_tokens:,} tokens)")
+    else:
+        st.caption(f"รวมทั้งระบบ: **{g_tokens:,}** / {max_tokens:,} tokens ({pct_tok:.1f}%)")
+
+    st.caption(f"คำขอวันนี้: **{g_reqs}** / {max_reqs} ครั้ง (ของคุณ: {u_tokens:,} tokens)")
+
+    if IS_ADMIN:
+        if st.button("🧹 รีเซ็ตตัวนับ Token วันนี้", use_container_width=True):
+            reset_today_tokens()
+            st.rerun()
+
 # --- พื้นที่หลัก 2 โหมด ---
 st.title("🎓 AI Study & Exam Assistant")
 tab_exam, tab_summary = st.tabs(["📚 1. เฉลยข้อสอบ & แยกบท", "📝 2. สรุปไฟล์เรียน / เสียง / Textbook เป็น PDF"])
 
 # ==========================================
-# TAB 1: ระบบเฉลยข้อสอบ (อัปโหลดไฟล์ หรือ วางลิงก์ไฟล์ Drive)
+# TAB 1: ระบบเฉลยข้อสอบ (รองรับปุ่มยกเลิกกลางคัน)
 # ==========================================
 with tab_exam:
+    if "exam_job" not in st.session_state:
+        st.session_state["exam_job"] = None
+
+    exam_job = st.session_state["exam_job"]
+
+    # กรณีกำลังประมวลผลข้อสอบอยู่ใน Background Thread
+    if exam_job is not None and exam_job["running"]:
+        st.info(f"⏳ กำลังประมวลผลไฟล์ที่ {exam_job['current_idx']}/{exam_job['total']} : **{exam_job['current_file']}** (ด้วย `{exam_job['model']}`)")
+        st.progress(exam_job["progress"])
+
+        if st.button("🛑 ยกเลิกการดำเนินการ", type="primary", key="cancel_exam_btn"):
+            exam_job["cancel_event"].set()
+            st.warning("กำลังสั่งยกเลิก... กรุณารอสักครู่")
+
+        time.sleep(1)
+        st.rerun()
+
+    # กรณีงานเพิ่งเสร็จสิ้นหรือถูกยกเลิก ให้แสดงผลแจ้งเตือนแล้วเคลียร์สถานะ
+    elif exam_job is not None and not exam_job["running"]:
+        if exam_job["cancelled"]:
+            st.warning(f"🛑 ยกเลิกการดำเนินการแล้ว (บันทึกไฟล์ที่ทำเสร็จก่อนหน้าไว้ {exam_job['completed_count']} ไฟล์)")
+        else:
+            st.success(f"✅ ประมวลผลเสร็จสิ้นทั้งหมด {exam_job['completed_count']} ไฟล์!")
+        for err in exam_job["errors"]:
+            st.error(err)
+        st.session_state["exam_job"] = None
+
+    # ฟอร์มนำเข้าไฟล์ข้อสอบ
     input_method = st.radio(
         "เลือกวิธีนำเข้าไฟล์ข้อสอบ",
         options=["📁 อัปโหลดไฟล์ PDF / รูปภาพ (เลือกได้หลายไฟล์พร้อมกัน)", "🔗 วางลิงก์ไฟล์เดี่ยวจาก Google Drive"],
         horizontal=True
     )
+
+    def start_exam_background_job(tasks_list):
+        cancel_ev = threading.Event()
+        job_state = {
+            "running": True,
+            "cancelled": False,
+            "cancel_event": cancel_ev,
+            "current_idx": 1,
+            "total": len(tasks_list),
+            "current_file": tasks_list[0]["name"],
+            "progress": 0.0,
+            "completed_count": 0,
+            "errors": [],
+            "model": selected_model
+        }
+        st.session_state["exam_job"] = job_state
+
+        def worker():
+            for idx, task in enumerate(tasks_list):
+                if cancel_ev.is_set():
+                    job_state["cancelled"] = True
+                    break
+                job_state["current_idx"] = idx + 1
+                job_state["current_file"] = task["name"]
+                try:
+                    if task["type"] == "drive_link":
+                        raw_bytes, mime_type, f_name = download_public_drive_file(task["url"])
+                        job_state["current_file"] = f_name
+                    else:
+                        raw_bytes, mime_type, f_name = task["bytes"], task["mime"], task["name"]
+
+                    if cancel_ev.is_set():
+                        job_state["cancelled"] = True
+                        break
+
+                    f_hash = hashlib.md5(raw_bytes).hexdigest()
+                    solved = analyze_exam_with_gemini(
+                        raw_bytes, mime_type, f_name, gemini_key, selected_model, use_thinking, CURRENT_USER
+                    )
+                    if cancel_ev.is_set():
+                        job_state["cancelled"] = True
+                        break
+
+                    save_questions(CURRENT_USER, f_hash, f_name, solved)
+                    job_state["completed_count"] += 1
+                except Exception as e:
+                    job_state["errors"].append(f"ผิดพลาดที่ {job_state['current_file']}: {e}")
+
+                job_state["progress"] = (idx + 1) / len(tasks_list)
+                if idx < len(tasks_list) - 1 and not cancel_ev.is_set():
+                    for _ in range(4):
+                        if cancel_ev.is_set():
+                            break
+                        time.sleep(1)
+
+            if cancel_ev.is_set():
+                job_state["cancelled"] = True
+            job_state["running"] = False
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        st.rerun()
 
     if input_method == "📁 อัปโหลดไฟล์ PDF / รูปภาพ (เลือกได้หลายไฟล์พร้อมกัน)":
         uploaded_exams = st.file_uploader(
@@ -452,21 +640,8 @@ with tab_exam:
             elif not uploaded_exams:
                 st.error("กรุณาเลือกไฟล์ข้อสอบอย่างน้อย 1 ไฟล์ก่อนครับ")
             else:
-                progress = st.progress(0)
-                for idx, uf in enumerate(uploaded_exams):
-                    with st.spinner(f"กำลังใช้ {selected_model} อ่านและเฉลย: {uf.name}..."):
-                        try:
-                            raw_bytes = uf.getvalue()
-                            f_hash = hashlib.md5(raw_bytes).hexdigest()
-                            solved = analyze_exam_with_gemini(raw_bytes, uf.type, uf.name, gemini_key, selected_model, use_thinking)
-                            save_questions(CURRENT_USER, f_hash, uf.name, solved)
-                        except Exception as e:
-                            st.error(f"ผิดพลาดที่ไฟล์ {uf.name}: {e}")
-                    progress.progress((idx + 1) / len(uploaded_exams))
-                    if idx < len(uploaded_exams) - 1:
-                        time.sleep(4)
-                st.success("ประมวลผลเสร็จสิ้น!")
-                st.rerun()
+                tasks = [{"type": "upload", "bytes": uf.getvalue(), "mime": uf.type, "name": uf.name} for uf in uploaded_exams]
+                start_exam_background_job(tasks)
 
     else:
         col_link, col_btn = st.columns([3, 1])
@@ -483,16 +658,8 @@ with tab_exam:
             elif not drive_file_url:
                 st.error("กรุณาวางลิงก์ไฟล์ก่อนครับ")
             else:
-                with st.spinner(f"กำลังดาวน์โหลดและใช้ {selected_model} เฉลยข้อสอบ..."):
-                    try:
-                        raw_bytes, mime_type, f_name = download_public_drive_file(drive_file_url)
-                        f_hash = hashlib.md5(raw_bytes).hexdigest()
-                        solved = analyze_exam_with_gemini(raw_bytes, mime_type, f_name, gemini_key, selected_model, use_thinking)
-                        save_questions(CURRENT_USER, f_hash, f_name, solved)
-                        st.success(f"เฉลยไฟล์ {f_name} เสร็จสิ้น!")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
+                tasks = [{"type": "drive_link", "url": drive_file_url, "name": "ไฟล์จาก Google Drive"}]
+                start_exam_background_job(tasks)
 
     st.divider()
 
@@ -587,9 +754,35 @@ with tab_exam:
                     st.success(f"**คำตอบ:** {q['final_answer']}")
 
 # ==========================================
-# TAB 2: ระบบสรุปไฟล์เรียน / ไฟล์เสียง / Textbook เป็น PDF
+# TAB 2: ระบบสรุปไฟล์เรียนเป็น PDF (รองรับปุ่มยกเลิกกลางคัน)
 # ==========================================
 with tab_summary:
+    if "summary_job" not in st.session_state:
+        st.session_state["summary_job"] = None
+
+    sum_job = st.session_state["summary_job"]
+
+    # กรณีกำลังสรุปไฟล์อยู่ใน Background Thread
+    if sum_job is not None and sum_job["running"]:
+        st.info(f"⏳ กำลังใช้ `{sum_job['model']}` วิเคราะห์ไฟล์ **{sum_job['file_name']}** และจัดหน้า PDF...")
+        if st.button("🛑 ยกเลิกการสรุปไฟล์", type="primary", key="cancel_summary_btn"):
+            sum_job["cancel_event"].set()
+            st.warning("กำลังสั่งยกเลิก... กรุณารอสักครู่")
+        time.sleep(1)
+        st.rerun()
+
+    elif sum_job is not None and not sum_job["running"]:
+        if sum_job["cancelled"]:
+            st.warning("🛑 ยกเลิกการสร้างไฟล์สรุปแล้ว")
+        elif sum_job["error"]:
+            st.error(f"เกิดข้อผิดพลาดในการสรุปไฟล์: {sum_job['error']}")
+        else:
+            st.session_state["generated_pdf"] = sum_job["pdf_bytes"]
+            st.session_state["generated_summary"] = sum_job["summary_data"]
+            st.session_state["generated_pdf_name"] = sum_job["pdf_name"]
+            st.success("✅ สร้างไฟล์สรุป PDF เรียบร้อยแล้ว!")
+        st.session_state["summary_job"] = None
+
     st.subheader("อัปโหลดสื่อการเรียนเพื่อสร้างไฟล์สรุป PDF")
     st.caption("รองรับไฟล์ PDF, Textbook, สไลด์อาจารย์, ไฟล์เสียงอัดบรรยาย (MP3, WAV, M4A, OGG), รูปภาพ และไฟล์ข้อความ")
 
@@ -626,22 +819,46 @@ with tab_summary:
         elif not uploaded_study_file:
             st.error("กรุณาอัปโหลดไฟล์ที่ต้องการสรุปก่อนครับ")
         else:
-            with st.spinner(f"กำลังใช้ {selected_model} วิเคราะห์ไฟล์ '{uploaded_study_file.name}' และสร้าง PDF ({summary_lang})..."):
-                try:
-                    summary_data = summarize_file_with_gemini(
-                        uploaded_study_file, custom_prompt, output_format, summary_lang,
-                        gemini_key, selected_model, use_thinking
-                    )
-                    is_slide = (output_format == "สไลด์ PDF (แนวนอน 16:9)")
-                    pdf_bytes = build_pdf_bytes(summary_data, is_slide, summary_lang)
+            cancel_ev = threading.Event()
+            f_bytes = uploaded_study_file.getvalue()
+            f_name = uploaded_study_file.name
+            is_slide = (output_format == "สไลด์ PDF (แนวนอน 16:9)")
+            lang_tag = "EN" if summary_lang == "ภาษาอังกฤษ (English)" else "TH"
+            out_pdf_name = f"Summary_{lang_tag}_{os.path.splitext(f_name)[0]}.pdf"
 
-                    lang_tag = "EN" if summary_lang == "ภาษาอังกฤษ (English)" else "TH"
-                    st.session_state["generated_pdf"] = pdf_bytes
-                    st.session_state["generated_summary"] = summary_data
-                    st.session_state["generated_pdf_name"] = f"Summary_{lang_tag}_{os.path.splitext(uploaded_study_file.name)[0]}.pdf"
-                    st.success("สร้างไฟล์สรุป PDF เรียบร้อยแล้ว!")
+            job_state = {
+                "running": True,
+                "cancelled": False,
+                "cancel_event": cancel_ev,
+                "file_name": f_name,
+                "model": selected_model,
+                "error": None,
+                "pdf_bytes": None,
+                "summary_data": None,
+                "pdf_name": out_pdf_name
+            }
+            st.session_state["summary_job"] = job_state
+
+            def summary_worker():
+                try:
+                    s_data = summarize_file_with_gemini(
+                        f_bytes, f_name, custom_prompt, output_format, summary_lang,
+                        gemini_key, selected_model, use_thinking, CURRENT_USER, cancel_ev
+                    )
+                    if cancel_ev.is_set() or s_data is None:
+                        job_state["cancelled"] = True
+                    else:
+                        p_bytes = build_pdf_bytes(s_data, is_slide, summary_lang)
+                        job_state["summary_data"] = s_data
+                        job_state["pdf_bytes"] = p_bytes
                 except Exception as e:
-                    st.error(f"เกิดข้อผิดพลาดในการสรุปไฟล์: {e}")
+                    job_state["error"] = str(e)
+                finally:
+                    job_state["running"] = False
+
+            t = threading.Thread(target=summary_worker, daemon=True)
+            t.start()
+            st.rerun()
 
     if "generated_pdf" in st.session_state:
         st.divider()
