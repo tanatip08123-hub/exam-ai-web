@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import fitz  # PyMuPDF สำหรับตัดรูปความละเอียดสูงจาก PDF
 import requests
 import streamlit as st
 from fpdf import FPDF
@@ -214,14 +216,20 @@ class SolvedQuestion(BaseModel):
 class ExamExtraction(BaseModel):
     questions: list[SolvedQuestion]
 
+class FigureCrop(BaseModel):
+    page_number: int = Field(description="เลขหน้าในไฟล์ PDF ที่รูปภาพนี้ปรากฏ (เริ่มนับหน้าแรกเป็น 1)")
+    box_2d: list[int] = Field(description="พิกัดกรอบสี่เหลี่ยมของรูปภาพ/กราฟ/ตาราง ในสเกล 0 ถึง 1000 รูปแบบ [ymin, xmin, ymax, xmax] ให้ครอบคลุมตัวรูปภาพและกราฟให้ครบถ้วน")
+    caption: str = Field(description="คำอธิบายใต้ภาพสั้นๆ เช่น Fig. 1: Schematic diagram")
+
 class SlideOrSection(BaseModel):
-    title: str = Field(description="หัวข้อของสไลด์หรือหัวข้อหลักของเนื้อหา")
-    bullets: list[str] = Field(description="ประเด็นสำคัญ เนื้อหาสรุป สูตร หรือคำอธิบายเป็นข้อๆ")
-    highlight_note: str = Field(description="ข้อควรจำ สูตรสำคัญ หรือจุดที่มักออกสอบ (ถ้าไม่มีให้เว้นว่าง)")
+    title: str = Field(description="ชื่อหัวข้อของสไลด์สั้นกระชับ (ห้ามใส่คำว่า 'สไลด์ 1:' หรือเลขนำหน้า เพราะระบบจะใส่เลขหน้าให้อัตโนมัติ)")
+    bullets: list[str] = Field(description="ประเด็นสำคัญ เนื้อหากระชับ อ่านง่าย 3-5 ข้อต่อสไลด์ (ไม่ยาวเยิ่นเย้อ)")
+    highlight_note: str = Field(description="สรุปใจความสำคัญสั้นๆ 1 ประโยค หรือสูตรหลัก (ถ้าไม่มีให้เว้นว่าง)")
+    figure: FigureCrop | None = Field(default=None, description="ข้อมูลรูปภาพ/กราฟ/วงจร/ตารางจากไฟล์ PDF ต้นฉบับที่ตรงกับเนื้อหาหน้านี้ (ใส่เมื่อหน้านั้นมีภาพประกอบที่เกี่ยวข้อง ถ้าไม่มีให้เป็น null)")
 
 class StudySummary(BaseModel):
     doc_title: str = Field(description="ชื่อเรื่องหลักของเอกสารสรุป")
-    subtitle: str = Field(description="คำอธิบายสั้นๆ หรือรายวิชา")
+    subtitle: str = Field(description="คำอธิบายสั้นๆ หรือชื่อรายวิชา/แหล่งที่มา")
     sections: list[SlideOrSection]
 
 # --- ฟังก์ชันเชื่อมต่อ Gemini (v1beta + จัดการ Thinking อัตโนมัติ) ---
@@ -254,7 +262,6 @@ def fetch_available_models(api_key: str):
         return fallback
 
 def build_safe_config(schema_cls, temperature: float, model_name: str, thinking_mode: str):
-    """สร้าง Config ที่ปลอดภัย ไม่พังแม้เลือกโมเดลที่บังคับ Thinking หรือไม่รองรับ Thinking"""
     config_args = {
         "response_mime_type": "application/json",
         "response_schema": schema_cls,
@@ -279,6 +286,45 @@ def get_model_daily_limits(model_name: str):
         return 1_500_000, 1000
     else:
         return 1_000_000, 250
+
+# --- ฟังก์ชันตัดรูปภาพจริงจากไฟล์ PDF ตามพิกัดที่ Gemini ระบุ ---
+def crop_figure_from_pdf(pdf_bytes: bytes, page_number: int, box_2d: list[int]) -> bytes | None:
+    try:
+        if not box_2d or len(box_2d) != 4:
+            return None
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        page_idx = page_number - 1
+        if page_idx < 0 or page_idx >= len(doc):
+            doc.close()
+            return None
+
+        page = doc[page_idx]
+        rect = page.rect
+        ymin, xmin, ymax, xmax = box_2d
+
+        # เผื่อขอบเล็กน้อย 1% ไม่ให้ตัดชิดเส้นเกินไป
+        ymin = max(0, ymin - 10)
+        xmin = max(0, xmin - 10)
+        ymax = min(1000, ymax + 10)
+        xmax = min(1000, xmax + 10)
+
+        if ymax <= ymin or xmax <= xmin:
+            doc.close()
+            return None
+
+        clip_rect = fitz.Rect(
+            (xmin / 1000.0) * rect.width,
+            (ymin / 1000.0) * rect.height,
+            (xmax / 1000.0) * rect.width,
+            (ymax / 1000.0) * rect.height
+        )
+        # เรนเดอร์ที่ความละเอียดสูง (2.5x ~ 180-200 DPI)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.5, 2.5), clip=clip_rect, alpha=False)
+        img_bytes = pix.tobytes("png")
+        doc.close()
+        return img_bytes
+    except Exception:
+        return None
 
 # --- ใช้ generate_content_stream เพื่อให้กดยกเลิกแล้วตัดจบได้ทันที ---
 def analyze_exam_with_gemini_stream(file_bytes: bytes, mime_type: str, file_name: str, gemini_key: str, model_name: str, thinking_mode: str, username: str, cancel_event: threading.Event, status_dict: dict):
@@ -319,6 +365,7 @@ def analyze_exam_with_gemini_stream(file_bytes: bytes, mime_type: str, file_name
 
 def summarize_file_with_gemini_stream(file_bytes: bytes, file_name: str, custom_prompt: str, output_format: str, summary_lang: str, gemini_key: str, model_name: str, thinking_mode: str, username: str, cancel_event: threading.Event, status_dict: dict):
     client = get_gemini_client(gemini_key)
+    is_pdf_source = file_name.lower().endswith(".pdf")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{file_name}") as tmp:
         tmp.write(file_bytes)
@@ -341,7 +388,7 @@ def summarize_file_with_gemini_stream(file_bytes: bytes, file_name: str, custom_
             return None
 
         style_instruction = (
-            "จัดโครงสร้างเป็นสไลด์นำเสนอ (Presentation Slides) แบ่งเป็นสไลด์ละ 1 หัวข้อย่อย เนื้อหากระชับ อ่านง่าย เป็น Bullet points ชัดเจน ไม่ยาวล้นหน้า"
+            "จัดโครงสร้างเป็นสไลด์นำเสนอ (Presentation Slides) แบ่งเป็นสไลด์ละ 1 หัวข้อหลัก มีประเด็นย่อย 3-5 ข้อที่กระชับ ตรงประเด็น อ่านง่าย ไม่เยิ่นเย้อ"
             if output_format == "สไลด์ PDF (แนวนอน 16:9)"
             else "จัดโครงสร้างเป็นเอกสารสรุปเนื้อหา (Study Note / Handout) อธิบายละเอียด เป็นลำดับขั้นตอน มีตัวอย่างและสูตรครบถ้วน"
         )
@@ -353,13 +400,22 @@ def summarize_file_with_gemini_stream(file_bytes: bytes, file_name: str, custom_
         else:
             lang_instruction = "เขียนคำอธิบายหลักเป็นภาษาไทย โดยคงคำศัพท์เฉพาะทางเทคนิค/วิศวกรรม (Technical Terms) เป็นภาษาอังกฤษกำกับไว้ในวงเล็บ"
 
+        image_instruction = (
+            "สำคัญมาก: เนื่องจากไฟล์ต้นฉบับเป็น PDF ที่มีรูปภาพ/กราฟ/วงจร/ตารางประกอบ จงระบุพิกัดกรอบรูปภาพ (`figure`: `page_number` และ `box_2d` [ymin, xmin, ymax, xmax] ในสเกล 0-1000) ที่ตรงกับเนื้อหาของสไลด์แต่ละหน้าให้มากที่สุด เพื่อดึงรูปจริงจาก PDF มาแสดงคู่กับเนื้อหา (หากหน้านั้นมีรูปที่เกี่ยวข้องต้องใส่พิกัดให้ครบ ห้ามเขียนแค่ข้อความแนะนำรูป)"
+            if is_pdf_source else ""
+        )
+
         prompt = f"""
-        คุณคือผู้เชี่ยวชาญด้านการสรุปเนื้อหาวิชาการและจัดทำสื่อการเรียนการสอน
+        คุณคือผู้เชี่ยวชาญด้านการออกแบบสไลด์นำเสนอและสรุปเนื้อหาวิชาการ
         จงวิเคราะห์ไฟล์ที่แนบมานี้ แล้วสรุปเนื้อหาออกมาตามคำสั่งดังนี้:
         - ภาษาที่ใช้สรุป: {lang_instruction}
         - รูปแบบเอกสาร: {style_instruction}
-        - ความต้องการเฉพาะของผู้ใช้: {custom_prompt if custom_prompt.strip() else "สรุปเนื้อหาสำคัญทั้งหมดให้ครบถ้วน เข้าใจง่าย เหมาะสำหรับอ่านทบทวนก่อนสอบ"}
-        - หมายเหตุ: สำหรับสมการหรือสัญลักษณ์ทางคณิตศาสตร์/วิศวกรรม ให้เขียนในรูปแบบข้อความธรรมดาที่อ่านง่าย (เช่น V = I * R, x^2, sqrt(x)) เพื่อให้แสดงผลในไฟล์ PDF ได้สวยงามโดยไม่ติดโค้ด LaTeX ดิบ
+        - ความต้องการเฉพาะของผู้ใช้: {custom_prompt if custom_prompt.strip() else "สรุปเนื้อหาสำคัญทั้งหมดให้ครบถ้วน เข้าใจง่าย เหมาะสำหรับนำเสนอและทบทวนก่อนสอบ"}
+        - {image_instruction}
+        - กฎการจัดรูปแบบข้อความ:
+          1. ในช่อง `title` ห้ามใส่คำว่า 'สไลด์ 1:' หรือเลขนำหน้า ให้ใส่ชื่อหัวข้อตรงๆ เช่น 'ที่มาและความสำคัญของ GIS'
+          2. เขียนสมการให้อ่านง่ายในรูปแบบข้อความปกติ เช่น E = a * P^b, SF6/N2 = 50/50 (ห้ามใส่เครื่องหมาย $ ของ LaTeX)
+          3. แต่ละ bullet ให้กระชับ ได้ใจความ ไม่ยาวเกิน 2 บรรทัดต่อข้อ
         """
 
         cfg = build_safe_config(StudySummary, 0.2, model_name, thinking_mode)
@@ -390,16 +446,28 @@ def summarize_file_with_gemini_stream(file_bytes: bytes, file_name: str, custom_
 
         if cancel_event.is_set():
             return None
-        return json.loads("".join(chunks_text))
+
+        summary_obj = json.loads("".join(chunks_text))
+
+        # ตัดรูปจริงจากไฟล์ PDF ต้นฉบับแนบเข้าไปในแต่ละ section
+        if is_pdf_source:
+            for sec in summary_obj.get("sections", []):
+                fig = sec.get("figure")
+                if fig and fig.get("page_number") and fig.get("box_2d"):
+                    cropped_png = crop_figure_from_pdf(file_bytes, fig["page_number"], fig["box_2d"])
+                    if cropped_png:
+                        sec["cropped_image_bytes"] = cropped_png
+
+        return summary_obj
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-# --- ฟังก์ชันสร้างไฟล์ PDF ---
+# --- ฟังก์ชันสร้างไฟล์ PDF ดีไซน์ใหม่ (2 คอลัมน์ + รูปจริง + การ์ดสวยงาม) ---
 def find_thai_font():
     candidates = [
-        "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
         "/usr/share/fonts/truetype/tlwg/Waree.ttf",
+        "/usr/share/fonts/truetype/tlwg/Garuda.ttf",
         "/usr/share/fonts/truetype/tlwg/Loma.ttf",
         "C:/Windows/Fonts/tahoma.ttf",
         "/System/Library/Fonts/Supplemental/Thonburi.ttc"
@@ -409,14 +477,20 @@ def find_thai_font():
             return path
     return None
 
+def clean_text_for_pdf(txt: str) -> str:
+    # ล้างเครื่องหมาย $ หรือสัญลักษณ์แปลกๆ ที่อาจหลุดมา
+    txt = txt.replace("$", "").replace("**", "")
+    # ป้องกันไม่ให้วงเล็บภาษาอังกฤษยาวๆ ถูกตัดคำกลางคำแบบน่าเกลียด
+    return re.sub(r"\s+", " ", txt).strip()
+
 def build_pdf_bytes(summary_data: dict, is_slide: bool, summary_lang: str) -> bytes:
     font_path = find_thai_font()
     if is_slide:
-        pdf = FPDF(orientation="L", unit="mm", format=(190, 338))
+        pdf = FPDF(orientation="L", unit="mm", format=(190, 338))  # 16:9 Widescreen
+        pdf.set_auto_page_break(auto=False)
     else:
         pdf = FPDF(orientation="P", unit="mm", format="A4")
-
-    pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_auto_page_break(auto=True, margin=15)
 
     if font_path:
         pdf.add_font("UniFont", "", font_path)
@@ -425,80 +499,196 @@ def build_pdf_bytes(summary_data: dict, is_slide: bool, summary_lang: str) -> by
     else:
         font_family = "Helvetica"
 
-    note_prefix = "Key Note:" if summary_lang == "ภาษาอังกฤษ (English)" else "ข้อควรจำ / Note:"
+    note_prefix = "Key Takeaway:" if summary_lang == "ภาษาอังกฤษ (English)" else "สรุปประเด็นสำคัญ:"
+    doc_title = clean_text_for_pdf(summary_data.get("doc_title", "Study Summary"))
+    subtitle = clean_text_for_pdf(summary_data.get("subtitle", ""))
 
+    # --- หน้าปก (Cover Page) ---
     pdf.add_page()
-    pdf.set_fill_color(24, 49, 83)
     if is_slide:
+        # พื้นหลังสีกรมท่าเข้ม + แถบตกแต่งด้านซ้ายสีฟ้าสว่าง
+        pdf.set_fill_color(18, 38, 68)
         pdf.rect(0, 0, 338, 190, style="F")
+        pdf.set_fill_color(56, 139, 253)
+        pdf.rect(0, 0, 10, 190, style="F")
+
         pdf.set_text_color(255, 255, 255)
-        pdf.set_y(65)
-        pdf.set_font(font_family, "B", 28)
-        pdf.multi_cell(0, 14, summary_data.get("doc_title", "Study Summary"), align="C")
+        pdf.set_xy(28, 58)
+        pdf.set_font(font_family, "B", 26)
+        pdf.multi_cell(282, 13, doc_title, align="L")
+
         pdf.ln(6)
-        pdf.set_font(font_family, "", 16)
-        pdf.set_text_color(200, 220, 255)
-        pdf.multi_cell(0, 10, summary_data.get("subtitle", ""), align="C")
+        pdf.set_x(28)
+        pdf.set_font(font_family, "", 15)
+        pdf.set_text_color(180, 210, 250)
+        pdf.multi_cell(282, 9, subtitle, align="L")
+
+        pdf.set_xy(28, 165)
+        pdf.set_font(font_family, "", 11)
+        pdf.set_text_color(130, 160, 200)
+        pdf.cell(0, 8, f"Generated by AI Study Assistant  |  {len(summary_data.get('sections', []))} Slides")
     else:
-        pdf.rect(0, 0, 210, 45, style="F")
+        pdf.set_fill_color(18, 38, 68)
+        pdf.rect(0, 0, 210, 48, style="F")
+        pdf.set_fill_color(56, 139, 253)
+        pdf.rect(0, 48, 210, 2.5, style="F")
+
         pdf.set_text_color(255, 255, 255)
-        pdf.set_y(14)
-        pdf.set_font(font_family, "B", 20)
-        pdf.multi_cell(0, 10, summary_data.get("doc_title", "Study Summary"), align="L")
-        pdf.set_font(font_family, "", 12)
-        pdf.multi_cell(0, 7, summary_data.get("subtitle", ""), align="L")
-        pdf.set_y(55)
+        pdf.set_xy(15, 13)
+        pdf.set_font(font_family, "B", 18)
+        pdf.multi_cell(180, 9, doc_title, align="L")
+        pdf.set_x(15)
+        pdf.set_font(font_family, "", 11)
+        pdf.set_text_color(200, 220, 250)
+        pdf.multi_cell(180, 6, subtitle, align="L")
+        pdf.set_y(58)
 
     sections = summary_data.get("sections", [])
+    total_slides = len(sections)
+
     for idx, sec in enumerate(sections, start=1):
+        # ลบคำนำหน้าซ้ำซ้อนถ้า AI เผลอใส่มา
+        raw_title = clean_text_for_pdf(sec.get("title", ""))
+        clean_title = re.sub(r"^(สไลด์\s*\d+\s*[:\-\.]?\s*|\d+[\.\)]\s*)", "", raw_title)
+        bullets = [clean_text_for_pdf(b) for b in sec.get("bullets", []) if b.strip()]
+        note_txt = clean_text_for_pdf(sec.get("highlight_note", ""))
+        img_bytes = sec.get("cropped_image_bytes")
+        fig_caption = clean_text_for_pdf((sec.get("figure") or {}).get("caption", ""))
+
         if is_slide:
             pdf.add_page()
-            pdf.set_fill_color(24, 49, 83)
-            pdf.rect(0, 0, 338, 26, style="F")
+            # พื้นหลังสไลด์สีเทาอ่อนสบายตา
+            pdf.set_fill_color(246, 248, 252)
+            pdf.rect(0, 0, 338, 190, style="F")
+
+            # แถบหัวสไลด์ด้านบน
+            pdf.set_fill_color(18, 38, 68)
+            pdf.rect(0, 0, 338, 24, style="F")
+            pdf.set_fill_color(56, 139, 253)
+            pdf.rect(0, 24, 338, 1.5, style="F")
+
+            # ป้ายเลขหน้าสไลด์มุมขวาบน
+            pdf.set_xy(16, 5)
             pdf.set_text_color(255, 255, 255)
-            pdf.set_xy(15, 6)
-            pdf.set_font(font_family, "B", 18)
-            pdf.cell(0, 14, f"{idx}. {sec.get('title', '')}")
+            pdf.set_font(font_family, "B", 17)
+            pdf.cell(285, 14, f"{idx}. {clean_title}")
 
-            pdf.set_xy(18, 34)
-            pdf.set_text_color(30, 30, 30)
-            pdf.set_font(font_family, "", 15)
-            for b in sec.get("bullets", []):
-                pdf.set_x(18)
-                pdf.multi_cell(302, 9, f"•  {b}")
-                pdf.ln(2)
+            pdf.set_font(font_family, "", 11)
+            pdf.set_text_color(180, 210, 250)
+            pdf.cell(25, 14, f"{idx} / {total_slides}", align="R")
 
-            if sec.get("highlight_note"):
-                pdf.ln(3)
-                pdf.set_x(18)
-                pdf.set_fill_color(255, 248, 220)
-                pdf.set_text_color(130, 90, 0)
-                pdf.set_font(font_family, "B", 14)
-                pdf.multi_cell(302, 9, f"{note_prefix} {sec['highlight_note']}", fill=True)
+            has_image = bool(img_bytes)
+
+            if has_image:
+                # --- LAYOUT แบบ 2 คอลัมน์ (ซ้าย: การ์ดเนื้อหา 175mm, ขวา: การ์ดรูปภาพ 130mm) ---
+                # การ์ดฝั่งซ้าย
+                pdf.set_fill_color(255, 255, 255)
+                pdf.set_draw_color(220, 226, 236)
+                pdf.rect(14, 32, 176, 144, style="FD")
+
+                pdf.set_xy(20, 38)
+                pdf.set_text_color(30, 41, 59)
+                pdf.set_font(font_family, "", 13)
+                for b in bullets:
+                    if pdf.get_y() > 142:
+                        break
+                    pdf.set_x(20)
+                    pdf.multi_cell(164, 7.5, f"•  {b}")
+                    pdf.ln(2.5)
+
+                if note_txt and pdf.get_y() <= 156:
+                    y_note = max(pdf.get_y() + 2, 146)
+                    pdf.set_xy(20, y_note)
+                    pdf.set_fill_color(235, 244, 255)
+                    pdf.set_text_color(18, 55, 110)
+                    pdf.set_font(font_family, "B", 12)
+                    pdf.multi_cell(164, 7, f"💡 {note_prefix} {note_txt}", fill=True)
+
+                # การ์ดฝั่งขวา (แสดงรูปภาพจริงจาก PDF)
+                pdf.set_fill_color(255, 255, 255)
+                pdf.rect(196, 32, 128, 144, style="FD")
+                try:
+                    img_stream = io.BytesIO(img_bytes)
+                    # วางรูปให้กึ่งกลางการ์ดฝั่งขวา โดยรักษาสัดส่วนภาพอัตโนมัติ
+                    pdf.image(img_stream, x=201, y=37, w=118, h=118, keep_aspect_ratio=True)
+                    if fig_caption:
+                        pdf.set_xy(200, 159)
+                        pdf.set_font(font_family, "", 10.5)
+                        pdf.set_text_color(90, 100, 115)
+                        pdf.multi_cell(120, 5.5, fig_caption, align="C")
+                except Exception:
+                    pass
+            else:
+                # --- LAYOUT แบบเต็มหน้า (กรณีสไลด์นั้นไม่มีรูปภาพ) ---
+                pdf.set_fill_color(255, 255, 255)
+                pdf.set_draw_color(220, 226, 236)
+                pdf.rect(16, 32, 306, 144, style="FD")
+
+                pdf.set_xy(24, 40)
+                pdf.set_text_color(30, 41, 59)
+                pdf.set_font(font_family, "", 14.5)
+                for b in bullets:
+                    if pdf.get_y() > 144:
+                        break
+                    pdf.set_x(24)
+                    pdf.multi_cell(290, 8.5, f"•  {b}")
+                    pdf.ln(3)
+
+                if note_txt:
+                    y_note = max(pdf.get_y() + 3, 148)
+                    pdf.set_xy(24, y_note)
+                    pdf.set_fill_color(235, 244, 255)
+                    pdf.set_text_color(18, 55, 110)
+                    pdf.set_font(font_family, "B", 13)
+                    pdf.multi_cell(290, 8, f"💡 {note_prefix} {note_txt}", fill=True)
+
+            # Footer ด้านล่างสไลด์
+            pdf.set_xy(16, 180)
+            pdf.set_font(font_family, "", 9.5)
+            pdf.set_text_color(130, 140, 155)
+            pdf.cell(0, 6, doc_title[:95])
+
         else:
+            # --- รูปแบบเอกสาร A4 แนวตั้ง ---
             pdf.ln(4)
-            pdf.set_text_color(24, 49, 83)
-            pdf.set_font(font_family, "B", 15)
-            pdf.multi_cell(0, 9, f"{idx}. {sec.get('title', '')}")
-            pdf.set_draw_color(200, 210, 225)
+            pdf.set_text_color(18, 38, 68)
+            pdf.set_font(font_family, "B", 14.5)
+            pdf.multi_cell(0, 8.5, f"{idx}. {clean_title}")
+            pdf.set_draw_color(56, 139, 253)
             pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-            pdf.ln(2)
-
-            pdf.set_text_color(30, 30, 30)
-            pdf.set_font(font_family, "", 12)
-            for b in sec.get("bullets", []):
-                pdf.set_x(14)
-                pdf.multi_cell(185, 7, f"•  {b}")
-                pdf.ln(1)
-
-            if sec.get("highlight_note"):
-                pdf.ln(2)
-                pdf.set_x(14)
-                pdf.set_fill_color(240, 245, 255)
-                pdf.set_text_color(24, 49, 83)
-                pdf.set_font(font_family, "B", 11)
-                pdf.multi_cell(185, 7, f"{note_prefix} {sec['highlight_note']}", fill=True)
             pdf.ln(3)
+
+            pdf.set_text_color(30, 41, 59)
+            pdf.set_font(font_family, "", 12)
+            for b in bullets:
+                pdf.set_x(14)
+                pdf.multi_cell(184, 7, f"•  {b}")
+                pdf.ln(1.5)
+
+            if img_bytes:
+                pdf.ln(2)
+                try:
+                    if pdf.get_y() > 210:
+                        pdf.add_page()
+                    img_stream = io.BytesIO(img_bytes)
+                    pdf.image(img_stream, x=45, w=120, keep_aspect_ratio=True)
+                    if fig_caption:
+                        pdf.ln(1)
+                        pdf.set_font(font_family, "", 10)
+                        pdf.set_text_color(100, 110, 125)
+                        pdf.multi_cell(0, 5.5, fig_caption, align="C")
+                    pdf.ln(2)
+                except Exception:
+                    pass
+
+            if note_txt:
+                pdf.ln(1)
+                pdf.set_x(14)
+                pdf.set_fill_color(235, 244, 255)
+                pdf.set_text_color(18, 55, 110)
+                pdf.set_font(font_family, "B", 11)
+                pdf.multi_cell(184, 7, f"📌 {note_prefix} {note_txt}", fill=True)
+            pdf.ln(4)
 
     return bytes(pdf.output())
 
@@ -570,7 +760,7 @@ st.title("🎓 AI Study & Exam Assistant")
 tab_exam, tab_summary = st.tabs(["📚 1. เฉลยข้อสอบ & แยกบท", "📝 2. สรุปไฟล์เรียน / เสียง / Textbook เป็น PDF"])
 
 # ==========================================
-# TAB 1: ระบบเฉลยข้อสอบ (ใช้ Fragment อัปเดตเฉพาะจุด ไม่ค้าง Stop)
+# TAB 1: ระบบเฉลยข้อสอบ
 # ==========================================
 with tab_exam:
     if "exam_job" not in st.session_state:
@@ -811,7 +1001,7 @@ with tab_exam:
                     st.success(f"**คำตอบ:** {q['final_answer']}")
 
 # ==========================================
-# TAB 2: ระบบสรุปไฟล์เรียนเป็น PDF (ใช้ Fragment อัปเดตเฉพาะจุด ไม่ค้าง Stop)
+# TAB 2: ระบบสรุปไฟล์เรียนเป็น PDF (ตัดรูปจริงจาก PDF + ดีไซน์สไลด์ 2 คอลัมน์)
 # ==========================================
 with tab_summary:
     if "summary_job" not in st.session_state:
@@ -824,7 +1014,7 @@ with tab_summary:
             return
 
         if job["running"]:
-            chars_info = f" (สร้างเนื้อหาแล้ว {job['received_chars']:,} ตัวอักษร)" if job["received_chars"] > 0 else " (กำลังอ่านและวิเคราะห์ไฟล์...)"
+            chars_info = f" (สร้างเนื้อหาแล้ว {job['received_chars']:,} ตัวอักษร)" if job["received_chars"] > 0 else " (กำลังอ่านไฟล์และดึงรูปประกอบ...)"
             st.info(f"⏳ กำลังใช้ `{job['model']}` สรุปไฟล์ **{job['file_name']}**{chars_info}")
 
             if st.button("🛑 ยกเลิกทันที", type="primary", key="cancel_summary_now"):
@@ -857,10 +1047,10 @@ with tab_summary:
             st.session_state["generated_pdf"] = s_res["pdf_bytes"]
             st.session_state["generated_summary"] = s_res["summary_data"]
             st.session_state["generated_pdf_name"] = s_res["pdf_name"]
-            st.success("✅ สร้างไฟล์สรุป PDF เรียบร้อยแล้ว!")
+            st.success("✅ สร้างไฟล์สรุป PDF พร้อมภาพประกอบเรียบร้อยแล้ว!")
 
     st.subheader("อัปโหลดสื่อการเรียนเพื่อสร้างไฟล์สรุป PDF")
-    st.caption("รองรับไฟล์ PDF, Textbook, สไลด์อาจารย์, ไฟล์เสียงอัดบรรยาย (MP3, WAV, M4A, OGG), รูปภาพ และไฟล์ข้อความ")
+    st.caption("รองรับไฟล์ PDF, Textbook, สไลด์อาจารย์ (ดึงรูปกราฟ/วงจร/ตารางจริงมาใส่ในสไลด์อัตโนมัติ), ไฟล์เสียงอัดบรรยาย (MP3, WAV, M4A, OGG) และรูปภาพ")
 
     uploaded_study_file = st.file_uploader(
         "📁 เลือกไฟล์ที่ต้องการสรุป",
@@ -885,7 +1075,7 @@ with tab_summary:
     with col_opt:
         custom_prompt = st.text_area(
             "✍️ ระบุแนวทางการสรุปที่ต้องการ (Prompt)",
-            placeholder="ตัวอย่าง:\n- สรุปเน้นเฉพาะสูตรคำนวณ เงื่อนไขการใช้งาน และจุดที่มักออกสอบ\n- Summarize key concepts, equations, and exam tips concisely.\n- ถอดความจากไฟล์เสียงบรรยายนี้ แล้วจัดหมวดหมู่เป็นหัวข้อพร้อมตัวอย่างประกอบ",
+            placeholder="ตัวอย่าง:\n- ทำเป็นสไลด์สำหรับพรีเซนต์ ใส่รูปกราฟและผลจำลองจากเปเปอร์ด้วย\n- สรุปเน้นเฉพาะสูตรคำนวณ เงื่อนไขการใช้งาน และจุดที่มักออกสอบ\n- ถอดความจากไฟล์เสียงบรรยายนี้ แล้วจัดหมวดหมู่เป็นหัวข้อพร้อมตัวอย่างประกอบ",
             height=130
         )
 
@@ -948,7 +1138,7 @@ with tab_summary:
             type="primary"
         )
 
-        st.markdown("### 👀 ตัวอย่างเนื้อหาที่สรุปได้")
+        st.markdown("### 👀 ตัวอย่างเนื้อหาและรูปภาพที่สรุปได้")
         s_data = st.session_state["generated_summary"]
         st.markdown(f"#### {s_data.get('doc_title', '')}")
         if s_data.get("subtitle"):
@@ -956,8 +1146,25 @@ with tab_summary:
 
         for idx, sec in enumerate(s_data.get("sections", []), start=1):
             with st.container(border=True):
-                st.markdown(f"**{idx}. {sec.get('title', '')}**")
-                for b in sec.get("bullets", []):
-                    st.markdown(f"- {b}")
-                if sec.get("highlight_note"):
-                    st.info(f"💡 {sec['highlight_note']}")
+                raw_t = sec.get("title", "")
+                clean_t = re.sub(r"^(สไลด์\s*\d+\s*[:\-\.]?\s*|\d+[\.\)]\s*)", "", raw_t)
+                st.markdown(f"**{idx}. {clean_t}**")
+
+                if sec.get("cropped_image_bytes"):
+                    c_txt, c_img = st.columns([1.4, 1])
+                    with c_txt:
+                        for b in sec.get("bullets", []):
+                            st.markdown(f"- {b}")
+                        if sec.get("highlight_note"):
+                            st.info(f"💡 {sec['highlight_note']}")
+                    with c_img:
+                        st.image(
+                            sec["cropped_image_bytes"],
+                            caption=(sec.get("figure") or {}).get("caption", ""),
+                            use_container_width=True
+                        )
+                else:
+                    for b in sec.get("bullets", []):
+                        st.markdown(f"- {b}")
+                    if sec.get("highlight_note"):
+                        st.info(f"💡 {sec['highlight_note']}")
